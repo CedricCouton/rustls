@@ -235,8 +235,10 @@ mod handshake;
 mod suites;
 mod ticketer;
 mod server;
-mod client;
-mod key;
+#[allow(missing_docs)]
+pub mod client;
+#[allow(missing_docs)]
+pub mod key;
 mod bs_debug;
 mod keylog;
 
