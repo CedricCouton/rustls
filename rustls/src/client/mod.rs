@@ -13,12 +13,11 @@ use crate::anchors;
 use crate::sign;
 use crate::error::TLSError;
 use crate::key;
-use crate::vecbuf::WriteV;
 #[cfg(feature = "logging")]
 use crate::log::trace;
 
 use std::sync::Arc;
-use std::io;
+use std::io::{self, IoSlice};
 use std::fmt;
 use std::mem;
 
@@ -217,9 +216,10 @@ impl ClientConfig {
     /// `key_der` is a DER-encoded RSA or ECDSA private key.
     pub fn set_single_client_cert(&mut self,
                                   cert_chain: Vec<key::Certificate>,
-                                  key_der: key::PrivateKey) {
-        let resolver = handy::AlwaysResolvesClientCert::new(cert_chain, &key_der);
+                                  key_der: key::PrivateKey) -> Result<(), TLSError> {
+        let resolver = handy::AlwaysResolvesClientCert::new(cert_chain, &key_der)?;
         self.client_auth_cert_resolver = Arc::new(resolver);
+        Ok(())
     }
 
     /// Access configuration options whose use is dangerous and requires
@@ -371,7 +371,7 @@ pub struct ClientSessionImpl {
     pub alpn_protocol: Option<Vec<u8>>,
     pub common: SessionCommon,
     pub error: Option<TLSError>,
-    pub state: Option<Box<dyn hs::State + Send + Sync>>,
+    pub state: Option<hs::NextState>,
     pub server_cert_chain: CertificatePayload,
     pub early_data: EarlyData,
     pub resumption_ciphersuite: Option<&'static SupportedCipherSuite>,
@@ -495,13 +495,24 @@ impl ClientSessionImpl {
         Ok(())
     }
 
+    fn reject_renegotiation_attempt(&mut self) -> Result<(), TLSError> {
+        self.common.send_warning_alert(AlertDescription::NoRenegotiation);
+        Ok(())
+    }
+
     fn queue_unexpected_alert(&mut self) {
         self.common.send_fatal_alert(AlertDescription::UnexpectedMessage);
     }
 
-    fn reject_renegotiation_attempt(&mut self) -> Result<(), TLSError> {
-        self.common.send_warning_alert(AlertDescription::NoRenegotiation);
-        Ok(())
+    fn maybe_send_unexpected_alert(&mut self, rc: hs::NextStateOrError) -> hs::NextStateOrError {
+        match rc {
+            Err(TLSError::InappropriateMessage { .. }) |
+            Err(TLSError::InappropriateHandshakeMessage { .. }) => {
+                self.queue_unexpected_alert();
+            }
+            _ => {}
+        };
+        rc
     }
 
     /// Process `msg`.  First, we get the current state.  Then we ask what messages
@@ -517,13 +528,9 @@ impl ClientSessionImpl {
         }
 
         let state = self.state.take().unwrap();
-        state
-            .check_message(&msg)
-            .map_err(|err| {
-                self.queue_unexpected_alert();
-                err
-            })?;
-        self.state = Some(state.handle(self, msg)?);
+        let maybe_next_state = state.handle(self, msg);
+        let next_state = self.maybe_send_unexpected_alert(maybe_next_state)?;
+        self.state = Some(next_state);
 
         Ok(())
     }
@@ -665,10 +672,6 @@ impl Session for ClientSession {
         self.imp.common.write_tls(wr)
     }
 
-    fn writev_tls(&mut self, wr: &mut dyn WriteV) -> io::Result<usize> {
-        self.imp.common.writev_tls(wr)
-    }
-
     fn process_new_packets(&mut self) -> Result<(), TLSError> {
         self.imp.process_new_packets()
     }
@@ -739,6 +742,14 @@ impl io::Write for ClientSession {
     /// cause excess memory usage.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.imp.send_some_plaintext(buf)
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        let mut sz = 0;
+        for buf in bufs {
+            sz += self.imp.send_some_plaintext(buf)?;
+        }
+        Ok(sz)
     }
 
     fn flush(&mut self) -> io::Result<()> {

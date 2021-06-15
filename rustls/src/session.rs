@@ -10,7 +10,7 @@ use crate::msgs::enums::{ContentType, ProtocolVersion, AlertDescription, AlertLe
 use crate::error::TLSError;
 use crate::suites::SupportedCipherSuite;
 use crate::cipher;
-use crate::vecbuf::{ChunkVecBuffer, WriteV};
+use crate::vecbuf::ChunkVecBuffer;
 use crate::key;
 use crate::prf;
 use crate::rand;
@@ -51,11 +51,6 @@ pub trait Session: quic::QuicExt + Read + Write + Send + Sync {
     ///
     /// [`wants_write`]: #tymethod.wants_write
     fn write_tls(&mut self, wr: &mut dyn Write) -> Result<usize, io::Error>;
-
-    /// Like `write_tls`, but writes potentially many records in one
-    /// go via `wr`; a `rustls::WriteV`.  This function has the same semantics
-    /// as `write_tls` otherwise.
-    fn writev_tls(&mut self, wr: &mut dyn WriteV) -> Result<usize, io::Error>;
 
     /// Processes any new packets read by a previous call to `read_tls`.
     /// Errors from this function relate to TLS protocol errors, and
@@ -403,6 +398,7 @@ pub struct SessionCommon {
     peer_eof: bool,
     pub traffic: bool,
     pub early_traffic: bool,
+    sent_fatal_alert: bool,
     pub message_deframer: MessageDeframer,
     pub handshake_joiner: HandshakeJoiner,
     pub message_fragmenter: MessageFragmenter,
@@ -425,6 +421,7 @@ impl SessionCommon {
             peer_eof: false,
             traffic: false,
             early_traffic: false,
+            sent_fatal_alert: false,
             message_deframer: MessageDeframer::new(),
             handshake_joiner: HandshakeJoiner::new(),
             message_fragmenter: MessageFragmenter::new(mtu.unwrap_or(MAX_FRAGMENT_LEN)),
@@ -472,12 +469,9 @@ impl SessionCommon {
         }
 
         let rc = self.record_layer.decrypt_incoming(encr);
-        match rc {
-            Err(TLSError::PeerSentOversizedRecord) => {
-                self.send_fatal_alert(AlertDescription::RecordOverflow);
-            }
-            _ => {}
-        };
+        if let Err(TLSError::PeerSentOversizedRecord) = rc {
+            self.send_fatal_alert(AlertDescription::RecordOverflow);
+        }
         rc
     }
 
@@ -504,9 +498,10 @@ impl SessionCommon {
                 return Ok(());
             }
 
-            // Warnings are nonfatal for TLS1.2, but outlawed in TLS1.3.
+            // Warnings are nonfatal for TLS1.2, but outlawed in TLS1.3
+            // (except, for no good reason, user_cancelled).
             if alert.level == AlertLevel::Warning {
-                if self.is_tls13() {
+                if self.is_tls13() && alert.description != AlertDescription::UserCanceled {
                     self.send_fatal_alert(AlertDescription::DecodeError);
                 } else {
                     warn!("TLS alert warning received: {:#?}", msg);
@@ -591,10 +586,6 @@ impl SessionCommon {
 
     pub fn write_tls(&mut self, wr: &mut dyn Write) -> io::Result<usize> {
         self.sendable_tls.write_to(wr)
-    }
-
-    pub fn writev_tls(&mut self, wr: &mut dyn WriteV) -> io::Result<usize> {
-        self.sendable_tls.writev_to(wr)
     }
 
     /// Send plaintext application data, fragmenting and
@@ -719,8 +710,10 @@ impl SessionCommon {
 
     pub fn send_fatal_alert(&mut self, desc: AlertDescription) {
         warn!("Sending fatal alert {:?}", desc);
+        debug_assert!(!self.sent_fatal_alert);
         let m = Message::build_alert(AlertLevel::Fatal, desc);
         self.send_msg(m, self.record_layer.is_encrypting());
+        self.sent_fatal_alert = true;
     }
 
     pub fn send_close_notify(&mut self) {
@@ -731,6 +724,15 @@ impl SessionCommon {
     fn send_warning_alert_no_log(&mut self, desc: AlertDescription) {
         let m = Message::build_alert(AlertLevel::Warning, desc);
         self.send_msg(m, self.record_layer.is_encrypting());
+    }
+
+    pub fn is_quic(&self) -> bool {
+        #[cfg(feature = "quic")]
+        {
+            self.protocol == Protocol::Quic
+        }
+        #[cfg(not(feature = "quic"))]
+        false
     }
 }
 
@@ -744,6 +746,8 @@ pub(crate) struct Quic {
     pub early_secret: Option<ring::hkdf::Prk>,
     pub hs_secrets: Option<quic::Secrets>,
     pub traffic_secrets: Option<quic::Secrets>,
+    /// Whether keys derived from traffic_secrets have been passed to the QUIC implementation
+    pub returned_traffic_keys: bool,
 }
 
 #[cfg(feature = "quic")]
@@ -756,6 +760,7 @@ impl Quic {
             early_secret: None,
             hs_secrets: None,
             traffic_secrets: None,
+            returned_traffic_keys: false,
         }
     }
 }

@@ -14,7 +14,7 @@ use crate::msgs::codec::{Codec, Reader};
 use crate::msgs::persist;
 use crate::client::ClientSessionImpl;
 use crate::session::SessionSecrets;
-use crate::key_schedule::{KeySchedule, SecretKind};
+use crate::key_schedule::{KeyScheduleEarly, KeyScheduleHandshake};
 use crate::cipher;
 use crate::suites;
 use crate::verify;
@@ -22,13 +22,10 @@ use crate::rand;
 use crate::ticketer;
 #[cfg(feature = "logging")]
 use crate::log::{debug, trace};
+use crate::check::check_message;
 use crate::error::TLSError;
-use crate::handshake::check_handshake_message;
 #[cfg(feature = "quic")]
-use crate::{
-    msgs::base::PayloadU16,
-    session::Protocol
-};
+use crate::msgs::base::PayloadU16;
 
 use crate::client::common::{ServerCertDetails, HandshakeDetails};
 use crate::client::common::{ClientHelloDetails, ReceivedTicketDetails};
@@ -36,36 +33,12 @@ use crate::client::{tls12, tls13};
 
 use webpki;
 
-macro_rules! extract_handshake(
-  ( $m:expr, $t:path ) => (
-    match $m.payload {
-      MessagePayload::Handshake(ref hsp) => match hsp.payload {
-        $t(ref hm) => Some(hm),
-        _ => None
-      },
-      _ => None
-    }
-  )
-);
-
-macro_rules! extract_handshake_mut(
-  ( $m:expr, $t:path ) => (
-    match $m.payload {
-      MessagePayload::Handshake(hsp) => match hsp.payload {
-        $t(hm) => Some(hm),
-        _ => None
-      },
-      _ => None
-    }
-  )
-);
-
-pub type CheckResult = Result<(), TLSError>;
 pub type NextState = Box<dyn State + Send + Sync>;
 pub type NextStateOrError = Result<NextState, TLSError>;
 
 pub trait State {
-    fn check_message(&self, m: &Message) -> CheckResult;
+    /// Each handle() implementation consumes a whole TLS message, and returns
+    /// either an error or the next state.
     fn handle(self: Box<Self>, sess: &mut ClientSessionImpl, m: Message) -> NextStateOrError;
 
     fn export_keying_material(&self,
@@ -86,7 +59,8 @@ pub fn illegal_param(sess: &mut ClientSessionImpl, why: &str) -> TLSError {
 
 pub fn check_aligned_handshake(sess: &mut ClientSessionImpl) -> Result<(), TLSError> {
     if !sess.common.handshake_joiner.is_empty() {
-        Err(illegal_param(sess, "keys changed with pending hs fragment"))
+        sess.common.send_fatal_alert(AlertDescription::UnexpectedMessage);
+        Err(TLSError::PeerMisbehavedError("key epoch or handshake flight with pending fragment".to_string()))
     } else {
         Ok(())
     }
@@ -111,7 +85,7 @@ fn find_session(sess: &mut ClientSessionImpl, dns_name: webpki::DNSNameRef)
             None
         } else {
             #[cfg(feature = "quic")] {
-                if sess.common.protocol == Protocol::Quic {
+                if sess.common.is_quic() {
                     let params = PayloadU16::read(&mut reader)?;
                     sess.common.quic.params = Some(params.0);
                 }
@@ -166,7 +140,7 @@ pub fn start_handshake(sess: &mut ClientSessionImpl, host_name: webpki::DNSName,
 
 struct ExpectServerHello {
     handshake: HandshakeDetails,
-    early_key_schedule: Option<KeySchedule>,
+    early_key_schedule: Option<KeyScheduleEarly>,
     hello: ClientHelloDetails,
     server_cert: ServerCertDetails,
     may_send_cert_status: bool,
@@ -204,7 +178,7 @@ fn emit_client_hello_for_retry(sess: &mut ClientSessionImpl,
         (resuming.session_id, resuming.ticket.0.clone(), resuming.version)
     } else {
         debug!("Not resuming any session");
-        if handshake.session_id.is_empty() {
+        if handshake.session_id.is_empty() && !sess.common.is_quic() {
             handshake.session_id = random_sessionid();
         }
         (handshake.session_id, Vec::new(), ProtocolVersion::Unknown(0))
@@ -231,7 +205,7 @@ fn emit_client_hello_for_retry(sess: &mut ClientSessionImpl,
     }
     exts.push(ClientExtension::ECPointFormats(ECPointFormatList::supported()));
     exts.push(ClientExtension::NamedGroups(suites::KeyExchange::supported_groups().to_vec()));
-    exts.push(ClientExtension::SignatureAlgorithms(verify::supported_verify_schemes().to_vec()));
+    exts.push(ClientExtension::SignatureAlgorithms(sess.config.get_verifier().supported_verify_schemes()));
     exts.push(ClientExtension::ExtendedMasterSecretRequest);
     exts.push(ClientExtension::CertificateStatusRequest(CertificateStatusRequest::build_ocsp()));
 
@@ -344,9 +318,9 @@ fn emit_client_hello_for_retry(sess: &mut ClientSessionImpl,
         let client_early_traffic_secret = early_key_schedule
             .as_ref()
             .unwrap()
-            .derive_logged_secret(SecretKind::ClientEarlyTrafficSecret, &client_hello_hash,
-                                  &*sess.config.key_log,
-                                  &handshake.randoms.client);
+            .client_early_traffic_secret(&client_hello_hash,
+                                         &*sess.config.key_log,
+                                         &handshake.randoms.client);
         // Set early data encryption key
         sess.common
             .record_layer
@@ -396,10 +370,10 @@ pub fn sct_list_is_invalid(scts: &SCTList) -> bool {
 }
 
 impl ExpectServerHello {
-    fn into_expect_tls13_encrypted_extensions(self, key_schedule: KeySchedule) -> NextState {
+    fn into_expect_tls13_encrypted_extensions(self, key_schedule: KeyScheduleHandshake) -> NextState {
         Box::new(tls13::ExpectEncryptedExtensions {
             handshake: self.handshake,
-            key_schedule: key_schedule,
+            key_schedule,
             server_cert: self.server_cert,
             hello: self.hello,
         })
@@ -443,12 +417,8 @@ impl ExpectServerHello {
 }
 
 impl State for ExpectServerHello {
-    fn check_message(&self, m: &Message) -> CheckResult {
-        check_handshake_message(m, &[HandshakeType::ServerHello])
-    }
-
     fn handle(mut self: Box<Self>, sess: &mut ClientSessionImpl, m: Message) -> NextStateOrError {
-        let server_hello = extract_handshake!(m, HandshakePayload::ServerHello).unwrap();
+        let server_hello = require_handshake_msg!(m, HandshakeType::ServerHello, HandshakePayload::ServerHello)?;
         trace!("We got ServerHello {:#?}", server_hello);
 
         use crate::ProtocolVersion::{TLSv1_2, TLSv1_3};
@@ -542,10 +512,10 @@ impl State for ExpectServerHello {
         // For TLS1.3, start message encryption using
         // handshake_traffic_secret.
         if sess.common.is_tls13() {
-            tls13::validate_server_hello(sess, server_hello)?;
+            tls13::validate_server_hello(sess, &server_hello)?;
             let key_schedule = tls13::start_handshake_traffic(sess,
                                                               self.early_key_schedule.take(),
-                                                              server_hello,
+                                                              &server_hello,
                                                               &mut self.handshake,
                                                               &mut self.hello)?;
             tls13::emit_fake_ccs(&mut self.handshake, sess);
@@ -643,10 +613,10 @@ impl ExpectServerHelloOrHelloRetryRequest {
     }
 
     fn handle_hello_retry_request(mut self, sess: &mut ClientSessionImpl, m: Message) -> NextStateOrError {
-        check_handshake_message(&m, &[HandshakeType::HelloRetryRequest])?;
-
-        let hrr = extract_handshake!(m, HandshakePayload::HelloRetryRequest).unwrap();
+        let hrr = require_handshake_msg!(m, HandshakeType::HelloRetryRequest, HandshakePayload::HelloRetryRequest)?;
         trace!("Got HRR {:?}", hrr);
+
+        check_aligned_handshake(sess)?;
 
         let has_cookie = hrr.get_cookie().is_some();
         let req_group = hrr.get_requested_key_share_group();
@@ -721,18 +691,15 @@ impl ExpectServerHelloOrHelloRetryRequest {
         Ok(emit_client_hello_for_retry(sess,
                                        self.0.handshake,
                                        self.0.hello,
-                                       Some(hrr)))
+                                       Some(&hrr)))
     }
 }
 
 impl State for ExpectServerHelloOrHelloRetryRequest {
-    fn check_message(&self, m: &Message) -> CheckResult {
-        check_handshake_message(m,
-                                &[HandshakeType::ServerHello,
-                                  HandshakeType::HelloRetryRequest])
-    }
-
     fn handle(self: Box<Self>, sess: &mut ClientSessionImpl, m: Message) -> NextStateOrError {
+        check_message(&m,
+                      &[ContentType::Handshake],
+                      &[HandshakeType::ServerHello, HandshakeType::HelloRetryRequest])?;
         if m.is_handshake_type(HandshakeType::ServerHello) {
             self.into_expect_server_hello().handle(sess, m)
         } else {

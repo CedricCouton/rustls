@@ -18,13 +18,11 @@ use crate::msgs::persist;
 use crate::session::SessionSecrets;
 use crate::server::{ServerSessionImpl, ServerConfig, ClientHello};
 use crate::suites;
-use crate::verify;
 use crate::rand;
 use crate::sign;
 #[cfg(feature = "logging")]
 use crate::log::{trace, debug};
 use crate::error::TLSError;
-use crate::handshake::check_handshake_message;
 use webpki;
 #[cfg(feature = "quic")]
 use crate::session::Protocol;
@@ -32,24 +30,10 @@ use crate::session::Protocol;
 use crate::server::common::{HandshakeDetails, ServerKXDetails};
 use crate::server::{tls12, tls13};
 
-macro_rules! extract_handshake(
-  ( $m:expr, $t:path ) => (
-    match $m.payload {
-      MessagePayload::Handshake(ref hsp) => match hsp.payload {
-        $t(ref hm) => Some(hm),
-        _ => None
-      },
-      _ => None
-    }
-  )
-);
-
-pub type CheckResult = Result<(), TLSError>;
 pub type NextState = Box<dyn State + Send + Sync>;
 pub type NextStateOrError = Result<NextState, TLSError>;
 
 pub trait State {
-    fn check_message(&self, m: &Message) -> CheckResult;
     fn handle(self: Box<Self>, sess: &mut ServerSessionImpl, m: Message) -> NextStateOrError;
 
     fn export_keying_material(&self,
@@ -125,7 +109,8 @@ fn same_dns_name_or_both_none(a: Option<&webpki::DNSName>,
 // which is illegal.  Not mentioned in RFC.
 pub fn check_aligned_handshake(sess: &mut ServerSessionImpl) -> Result<(), TLSError> {
     if !sess.common.handshake_joiner.is_empty() {
-        Err(illegal_param(sess, "keys changed with pending hs fragment"))
+        sess.common.send_fatal_alert(AlertDescription::UnexpectedMessage);
+        Err(TLSError::PeerMisbehavedError("key epoch or handshake flight with pending fragment".to_string()))
     } else {
         Ok(())
     }
@@ -218,33 +203,32 @@ impl ExtensionProcessing {
             self.exts.push(ServerExtension::ServerNameAck);
         }
 
-        // Send status_request response if we have one.  This is not allowed
-        // if we're resuming, and is only triggered if we have an OCSP response
-        // to send.
-        if !for_resume &&
-           hello.find_extension(ExtensionType::StatusRequest).is_some() &&
-           server_key.is_some() &&
-           server_key.as_ref().unwrap().has_ocsp() {
-            self.send_cert_status = true;
+        if let Some(server_key) = server_key {
+            // Send status_request response if we have one.  This is not allowed
+            // if we're resuming, and is only triggered if we have an OCSP response
+            // to send.
+            if !for_resume &&
+               hello.find_extension(ExtensionType::StatusRequest).is_some() &&
+               server_key.has_ocsp() {
+                self.send_cert_status = true;
 
-            if !sess.common.is_tls13() {
-                // Only TLS1.2 sends confirmation in ServerHello
-                self.exts.push(ServerExtension::CertificateStatusAck);
+                if !sess.common.is_tls13() {
+                    // Only TLS1.2 sends confirmation in ServerHello
+                    self.exts.push(ServerExtension::CertificateStatusAck);
+                }
             }
-        }
 
-        if !for_resume &&
-           hello.find_extension(ExtensionType::SCT).is_some() &&
-           server_key.is_some() &&
-           server_key.as_ref().unwrap().has_sct_list() {
-            self.send_sct = true;
+            if !for_resume &&
+               hello.find_extension(ExtensionType::SCT).is_some() &&
+               server_key.has_sct_list() {
+                self.send_sct = true;
 
-            if !sess.common.is_tls13() {
-                let sct_list = server_key
-                    .unwrap()
-                    .take_sct_list()
-                    .unwrap();
-                self.exts.push(ServerExtension::make_sct(sct_list));
+                if !sess.common.is_tls13() {
+                    let sct_list = server_key
+                        .take_sct_list()
+                        .unwrap();
+                    self.exts.push(ServerExtension::make_sct(sct_list));
+                }
             }
         }
 
@@ -464,19 +448,26 @@ impl ExpectClientHello {
         Ok(kx)
     }
 
-    fn emit_certificate_req(&mut self, sess: &mut ServerSessionImpl) -> bool {
-        let client_auth = &sess.config.verifier;
+    fn emit_certificate_req(&mut self, sess: &mut ServerSessionImpl) -> Result<bool, TLSError> {
+        let client_auth = sess.config.get_verifier();
 
         if !client_auth.offer_client_auth() {
-            return false;
+            return Ok(false);
         }
 
-        let names = client_auth.client_auth_root_subjects();
+        let verify_schemes = client_auth.supported_verify_schemes();
+
+        let names = client_auth.client_auth_root_subjects(sess.get_sni())
+            .ok_or_else(|| {
+                debug!("could not determine root subjects based on SNI");
+                sess.common.send_fatal_alert(AlertDescription::AccessDenied);
+                TLSError::General("client rejected by client_auth_root_subjects".into())
+            })?;
 
         let cr = CertificateRequestPayload {
             certtypes: vec![ ClientCertificateType::RSASign,
                          ClientCertificateType::ECDSASign ],
-            sigschemes: verify::supported_verify_schemes().to_vec(),
+            sigschemes: verify_schemes,
             canames: names,
         };
 
@@ -492,7 +483,7 @@ impl ExpectClientHello {
         trace!("Sending CertificateRequest {:?}", m);
         self.handshake.transcript.add_message(&m);
         sess.common.send_msg(m, false);
-        true
+        Ok(true)
     }
 
     fn emit_server_hello_done(&mut self, sess: &mut ServerSessionImpl) {
@@ -552,12 +543,8 @@ impl ExpectClientHello {
 }
 
 impl State for ExpectClientHello {
-    fn check_message(&self, m: &Message) -> CheckResult {
-        check_handshake_message(m, &[HandshakeType::ClientHello])
-    }
-
     fn handle(mut self: Box<Self>, sess: &mut ServerSessionImpl, m: Message) -> NextStateOrError {
-        let client_hello = extract_handshake!(m, HandshakePayload::ClientHello).unwrap();
+        let client_hello = require_handshake_msg!(m, HandshakeType::ClientHello, HandshakePayload::ClientHello)?;
         let tls13_enabled = sess.config.supports_version(ProtocolVersion::TLSv1_3);
         let tls12_enabled = sess.config.supports_version(ProtocolVersion::TLSv1_2);
         trace!("we got a clienthello {:?}", client_hello);
@@ -571,6 +558,9 @@ impl State for ExpectClientHello {
         if client_hello.has_duplicate_extension() {
             return Err(decode_error(sess, "client sent duplicate extensions"));
         }
+
+        // No handshake messages should follow this one in this flight.
+        check_aligned_handshake(sess)?;
 
         // Are we doing TLS1.3?
         let maybe_versions_ext = client_hello.get_versions_extension();
@@ -599,12 +589,14 @@ impl State for ExpectClientHello {
         // different way.
         let sni: Option<webpki::DNSName> = match client_hello.get_sni_extension() {
             Some(sni) => {
-                match sni.get_hostname() {
-                    Some(sni) => Some(sni.into()),
-                    None => {
-                        return Err(illegal_param(sess,
-                            "ClientHello SNI did not contain a hostname."));
-                    },
+                if sni.has_duplicate_names_for_type() {
+                    return Err(decode_error(sess, "ClientHello SNI contains duplicate name types"));
+                }
+
+                if let Some(hostname) = sni.get_single_hostname() {
+                    Some(hostname.into())
+                } else {
+                    return Err(illegal_param(sess, "ClientHello SNI did not contain a hostname"));
                 }
             },
             None => None,
@@ -798,7 +790,7 @@ impl State for ExpectClientHello {
         self.emit_certificate(sess, &mut certkey);
         self.emit_cert_status(sess, &mut certkey);
         let kx = self.emit_server_kx(sess, sigschemes, group, &mut certkey)?;
-        let doing_client_auth = self.emit_certificate_req(sess);
+        let doing_client_auth = self.emit_certificate_req(sess)?;
         self.emit_server_hello_done(sess);
 
         if doing_client_auth {

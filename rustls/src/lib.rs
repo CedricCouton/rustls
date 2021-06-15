@@ -199,6 +199,9 @@
 //   underneath.
 #![cfg_attr(feature = "cargo-clippy", allow(clippy::ptr_arg))]
 
+// Enable documentation for all features on docs.rs
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 // log for logging (optional).
 #[cfg(feature = "logging")]
 use log;
@@ -231,7 +234,8 @@ mod anchors;
 mod verify;
 #[cfg(test)]
 mod verifybench;
-mod handshake;
+#[macro_use]
+mod check;
 mod suites;
 mod ticketer;
 mod server;
@@ -279,12 +283,12 @@ pub use crate::verify::{NoClientAuth, AllowAnyAuthenticatedClient,
 pub use crate::suites::{ALL_CIPHERSUITES, BulkAlgorithm, SupportedCipherSuite};
 pub use crate::key::{Certificate, PrivateKey};
 pub use crate::keylog::{KeyLog, NoKeyLog, KeyLogFile};
-pub use crate::vecbuf::{WriteV, WriteVAdapter};
 
 /// Message signing interfaces and implementations.
 pub mod sign;
 
 #[cfg(feature = "quic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
 /// APIs for implementing QUIC TLS
 pub mod quic;
 
@@ -298,8 +302,13 @@ mod quic {
 }
 
 #[cfg(feature = "dangerous_configuration")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dangerous_configuration")))]
 pub use crate::verify::{ServerCertVerifier, ServerCertVerified,
-    ClientCertVerifier, ClientCertVerified, WebPKIVerifier};
+    ClientCertVerifier, ClientCertVerified, HandshakeSignatureValid,
+    WebPKIVerifier};
 #[cfg(feature = "dangerous_configuration")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dangerous_configuration")))]
 pub use crate::client::danger::DangerousClientConfig;
 
+/// This is the rustls manual.
+pub mod manual;

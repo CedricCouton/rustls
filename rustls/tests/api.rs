@@ -5,8 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::mem;
 use std::fmt;
 use std::env;
-use std::error::Error;
-use std::io::{self, Write, Read};
+use std::io::{self, Write, Read, IoSlice};
 
 use rustls;
 
@@ -22,8 +21,9 @@ use rustls::KeyLog;
 use rustls::ClientHello;
 #[cfg(feature = "quic")]
 use rustls::quic::{self, QuicExt, ClientQuicExt, ServerQuicExt};
-#[cfg(feature = "quic")]
-use ring::hkdf;
+
+#[cfg(feature = "dangerous_configuration")]
+use rustls::ClientCertVerified;
 
 use webpki;
 
@@ -229,7 +229,8 @@ fn client_can_get_server_cert() {
 fn server_can_get_client_cert() {
     for kt in ALL_KEY_TYPES.iter() {
         let mut client_config = make_client_config(*kt);
-        client_config.set_single_client_cert(kt.get_chain(), kt.get_key());
+        client_config.set_single_client_cert(kt.get_chain(), kt.get_key())
+            .unwrap();
 
         let server_config = Arc::new(make_server_config_with_mandatory_client_auth(*kt));
 
@@ -259,7 +260,8 @@ fn check_read_and_close(reader: &mut dyn io::Read, expect: &[u8]) {
 fn server_close_notify() {
     let kt = KeyType::RSA;
     let mut client_config = make_client_config(kt);
-    client_config.set_single_client_cert(kt.get_chain(), kt.get_key());
+    client_config.set_single_client_cert(kt.get_chain(), kt.get_key())
+        .unwrap();
 
     let server_config = Arc::new(make_server_config_with_mandatory_client_auth(kt));
 
@@ -287,7 +289,8 @@ fn server_close_notify() {
 fn client_close_notify() {
     let kt = KeyType::RSA;
     let mut client_config = make_client_config(kt);
-    client_config.set_single_client_cert(kt.get_chain(), kt.get_key());
+    client_config.set_single_client_cert(kt.get_chain(), kt.get_key())
+        .unwrap();
 
     let server_config = Arc::new(make_server_config_with_mandatory_client_auth(kt));
 
@@ -564,6 +567,230 @@ fn client_auth_works() {
     }
 }
 
+#[cfg(feature = "dangerous_configuration")]
+mod test_clientverifier {
+    use super::*;
+    use crate::common::MockClientVerifier;
+    use rustls::internal::msgs::enums::AlertDescription;
+    use rustls::internal::msgs::enums::ContentType;
+
+    // Client is authorized!
+    fn ver_ok() -> Result<ClientCertVerified, TLSError> {
+        Ok(rustls::ClientCertVerified::assertion())
+    }
+
+    // Use when we shouldn't even attempt verification
+    fn ver_unreachable() -> Result<ClientCertVerified, TLSError> {
+        unreachable!()
+    }
+
+    // Verifier that returns an error that we can expect
+    fn ver_err() -> Result<ClientCertVerified, TLSError> {
+        Err(TLSError::General("test err".to_string()))
+    }
+
+    #[test]
+    // Happy path, we resolve to a root, it is verified OK, should be able to connect
+    fn client_verifier_works() {
+        for kt in ALL_KEY_TYPES.iter() {
+            let client_verifier = MockClientVerifier {
+                verified: ver_ok,
+                subjects: Some(get_client_root_store(*kt).get_subjects()),
+                mandatory: Some(true),
+                offered_schemes: None,
+            };
+
+            let mut server_config = ServerConfig::new(Arc::new(client_verifier));
+            server_config.set_single_cert(kt.get_chain(), kt.get_key()).unwrap();
+
+            let server_config = Arc::new(server_config);
+            let client_config = make_client_config_with_auth(*kt);
+
+            for client_config in AllClientVersions::new(client_config) {
+                let (mut client, mut server) = make_pair_for_arc_configs(&Arc::new(client_config.clone()),
+                                                                     &server_config);
+                let err = do_handshake_until_error(&mut client, &mut server);
+                assert_eq!(err, Ok(()));
+            }
+        }
+    }
+
+    // Server offers no verification schemes
+    #[test]
+    fn client_verifier_no_schemes() {
+        for kt in ALL_KEY_TYPES.iter() {
+            let client_verifier = MockClientVerifier {
+                verified: ver_ok,
+                subjects: Some(get_client_root_store(*kt).get_subjects()),
+                mandatory: Some(true),
+                offered_schemes: Some(vec![]),
+            };
+
+            let mut server_config = ServerConfig::new(Arc::new(client_verifier));
+            server_config.set_single_cert(kt.get_chain(), kt.get_key()).unwrap();
+
+            let server_config = Arc::new(server_config);
+            let client_config = make_client_config_with_auth(*kt);
+
+            for client_config in AllClientVersions::new(client_config) {
+                let (mut client, mut server) = make_pair_for_arc_configs(&Arc::new(client_config.clone()),
+                                                                     &server_config);
+                let err = do_handshake_until_error(&mut client, &mut server);
+                assert_eq!(err, Err(TLSErrorFromPeer::Client(TLSError::CorruptMessagePayload(ContentType::Handshake))));
+            }
+        }
+    }
+
+    // Common case, we do not find a root store to resolve to
+    #[test]
+    fn client_verifier_no_root() {
+        for kt in ALL_KEY_TYPES.iter() {
+            let client_verifier = MockClientVerifier {
+                verified: ver_ok,
+                subjects: None,
+                mandatory: Some(true),
+                offered_schemes: None,
+            };
+
+            let mut server_config = ServerConfig::new(Arc::new(client_verifier));
+            server_config.set_single_cert(kt.get_chain(), kt.get_key()).unwrap();
+
+            let server_config = Arc::new(server_config);
+            let client_config = make_client_config_with_auth(*kt);
+
+            for client_config in AllClientVersions::new(client_config) {
+                let mut server = ServerSession::new(&server_config);
+                let mut client = ClientSession::new(&Arc::new(client_config), dns_name("notlocalhost"));
+                let errs = do_handshake_until_both_error(&mut client, &mut server);
+                assert_eq!(errs,
+                           Err(vec![
+                              TLSErrorFromPeer::Server(TLSError::General("client rejected by client_auth_root_subjects".into())),
+                              TLSErrorFromPeer::Client(TLSError::AlertReceived(AlertDescription::AccessDenied))
+                           ]));
+            }
+        }
+    }
+
+    // If we cannot resolve a root, we cannot decide if auth is mandatory
+    #[test]
+    fn client_verifier_no_auth_no_root() {
+        for kt in ALL_KEY_TYPES.iter() {
+            let client_verifier = MockClientVerifier {
+                verified: ver_unreachable,
+                subjects: None,
+                mandatory: Some(true),
+                offered_schemes: None,
+            };
+
+            let mut server_config = ServerConfig::new(Arc::new(client_verifier));
+            server_config.set_single_cert(kt.get_chain(), kt.get_key()).unwrap();
+
+            let server_config = Arc::new(server_config);
+            let client_config = make_client_config(*kt);
+
+            for client_config in AllClientVersions::new(client_config) {
+                let mut server = ServerSession::new(&server_config);
+                let mut client = ClientSession::new(&Arc::new(client_config), dns_name("notlocalhost"));
+                let errs = do_handshake_until_both_error(&mut client, &mut server);
+                assert_eq!(errs,
+                           Err(vec![
+                               TLSErrorFromPeer::Server(TLSError::General("client rejected by client_auth_root_subjects".into())),
+                               TLSErrorFromPeer::Client(TLSError::AlertReceived(AlertDescription::AccessDenied))
+                            ]));
+            }
+        }
+    }
+
+        // If we do have a root, we must do auth
+    #[test]
+    fn client_verifier_no_auth_yes_root() {
+        for kt in ALL_KEY_TYPES.iter() {
+            let client_verifier = MockClientVerifier {
+                verified: ver_unreachable,
+                subjects: Some(get_client_root_store(*kt).get_subjects()),
+                mandatory: Some(true),
+                offered_schemes: None,
+            };
+
+            let mut server_config = ServerConfig::new(Arc::new(client_verifier));
+            server_config.set_single_cert(kt.get_chain(), kt.get_key()).unwrap();
+
+            let server_config = Arc::new(server_config);
+            let client_config = make_client_config(*kt);
+
+            for client_config in AllClientVersions::new(client_config) {
+                println!("Failing: {:?}", client_config.versions);
+                let mut server = ServerSession::new(&server_config);
+                let mut client = ClientSession::new(&Arc::new(client_config), dns_name("localhost"));
+                let errs = do_handshake_until_both_error(&mut client, &mut server);
+                assert_eq!(errs,
+                           Err(vec![
+                               TLSErrorFromPeer::Server(TLSError::NoCertificatesPresented),
+                               TLSErrorFromPeer::Client(TLSError::AlertReceived(AlertDescription::CertificateRequired))
+                           ]));
+            }
+        }
+    }
+
+    #[test]
+    // Triple checks we propagate the TLSError through
+    fn client_verifier_fails_properly() {
+        for kt in ALL_KEY_TYPES.iter() {
+            let client_verifier = MockClientVerifier {
+                verified: ver_err,
+                subjects: Some(get_client_root_store(*kt).get_subjects()),
+                mandatory: Some(true),
+                offered_schemes: None,
+            };
+
+            let mut server_config = ServerConfig::new(Arc::new(client_verifier));
+            server_config.set_single_cert(kt.get_chain(), kt.get_key()).unwrap();
+
+            let server_config = Arc::new(server_config);
+            let client_config = make_client_config_with_auth(*kt);
+
+            for client_config in AllClientVersions::new(client_config) {
+                let mut server = ServerSession::new(&server_config);
+                let mut client = ClientSession::new(&Arc::new(client_config), dns_name("localhost"));
+                let err = do_handshake_until_error(&mut client, &mut server);
+                assert_eq!(err, Err(TLSErrorFromPeer::Server(
+                            TLSError::General("test err".into()))));
+            }
+        }
+    }
+
+
+    #[test]
+    // If a verifier returns a None on Mandatory-ness, then we error out
+    fn client_verifier_must_determine_client_auth_requirement_to_continue() {
+        for kt in ALL_KEY_TYPES.iter() {
+            let client_verifier = MockClientVerifier {
+                verified: ver_ok,
+                subjects: Some(get_client_root_store(*kt).get_subjects()),
+                mandatory: None,
+                offered_schemes: None,
+            };
+
+            let mut server_config = ServerConfig::new(Arc::new(client_verifier));
+            server_config.set_single_cert(kt.get_chain(), kt.get_key()).unwrap();
+
+            let server_config = Arc::new(server_config);
+            let client_config = make_client_config_with_auth(*kt);
+
+            for client_config in AllClientVersions::new(client_config) {
+                let mut server = ServerSession::new(&server_config);
+                let mut client = ClientSession::new(&Arc::new(client_config), dns_name("localhost"));
+                let errs = do_handshake_until_both_error(&mut client, &mut server);
+                assert_eq!(errs,
+                           Err(vec![
+                               TLSErrorFromPeer::Server(TLSError::General("client rejected by client_auth_mandatory".into())),
+                               TLSErrorFromPeer::Client(TLSError::AlertReceived(AlertDescription::AccessDenied))
+                           ]));
+            }
+        }
+    }
+} // mod test_clientverifier
+
 #[test]
 fn client_error_is_sticky() {
     let (mut client, _) = make_pair(KeyType::RSA);
@@ -615,6 +842,23 @@ fn server_respects_buffer_limit_pre_handshake() {
 }
 
 #[test]
+fn server_respects_buffer_limit_pre_handshake_with_vectored_write() {
+    let (mut client, mut server) = make_pair(KeyType::RSA);
+
+    server.set_buffer_limit(32);
+
+    assert_eq!(server.write_vectored(&[IoSlice::new(b"01234567890123456789"),
+                                       IoSlice::new(b"01234567890123456789")]).unwrap(),
+               32);
+
+    do_handshake(&mut client, &mut server);
+    transfer(&mut server, &mut client);
+    client.process_new_packets().unwrap();
+
+    check_read(&mut client, b"01234567890123456789012345678901");
+}
+
+#[test]
 fn server_respects_buffer_limit_post_handshake() {
     let (mut client, mut server) = make_pair(KeyType::RSA);
 
@@ -648,6 +892,23 @@ fn client_respects_buffer_limit_pre_handshake() {
 }
 
 #[test]
+fn client_respects_buffer_limit_pre_handshake_with_vectored_write() {
+    let (mut client, mut server) = make_pair(KeyType::RSA);
+
+    client.set_buffer_limit(32);
+
+    assert_eq!(client.write_vectored(&[IoSlice::new(b"01234567890123456789"),
+                                       IoSlice::new(b"01234567890123456789")]).unwrap(),
+               32);
+
+    do_handshake(&mut client, &mut server);
+    transfer(&mut client, &mut server);
+    server.process_new_packets().unwrap();
+
+    check_read(&mut server, b"01234567890123456789012345678901");
+}
+
+#[test]
 fn client_respects_buffer_limit_post_handshake() {
     let (mut client, mut server) = make_pair(KeyType::RSA);
 
@@ -666,7 +927,6 @@ fn client_respects_buffer_limit_post_handshake() {
 struct OtherSession<'a> {
     sess: &'a mut dyn Session,
     pub reads: usize,
-    pub writes: usize,
     pub writevs: Vec<Vec<usize>>,
     fail_ok: bool,
     pub short_writes: bool,
@@ -678,7 +938,6 @@ impl<'a> OtherSession<'a> {
         OtherSession {
             sess,
             reads: 0,
-            writes: 0,
             writevs: vec![],
             fail_ok: false,
             short_writes: false,
@@ -701,27 +960,15 @@ impl<'a> io::Read for OtherSession<'a> {
 }
 
 impl<'a> io::Write for OtherSession<'a> {
-    fn write(&mut self, mut b: &[u8]) -> io::Result<usize> {
-        self.writes += 1;
-        let l = self.sess.read_tls(b.by_ref())?;
-        let rc = self.sess.process_new_packets();
-
-        if !self.fail_ok {
-            rc.unwrap();
-        } else if rc.is_err() {
-            self.last_error = rc.err();
-        }
-
-        Ok(l)
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        unreachable!()
     }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
-}
 
-impl<'a> rustls::WriteV for OtherSession<'a> {
-    fn writev(&mut self, b: &[&[u8]]) -> io::Result<usize> {
+    fn write_vectored<'b>(&mut self, b: &[io::IoSlice<'b>]) -> io::Result<usize> {
         let mut total = 0;
         let mut lengths = vec![];
         for bytes in b {
@@ -784,7 +1031,8 @@ fn client_complete_io_for_write() {
             let mut pipe = OtherSession::new(&mut server);
             let (rdlen, wrlen) = client.complete_io(&mut pipe).unwrap();
             assert!(rdlen == 0 && wrlen > 0);
-            assert_eq!(pipe.writes, 2);
+            println!("{:?}", pipe.writevs);
+            assert_eq!(pipe.writevs, vec![ vec![ 42, 42 ] ]);
         }
         check_read(&mut server, b"0123456789012345678901234567890123456789");
     }
@@ -843,7 +1091,7 @@ fn server_complete_io_for_write() {
             let mut pipe = OtherSession::new(&mut client);
             let (rdlen, wrlen) = server.complete_io(&mut pipe).unwrap();
             assert!(rdlen == 0 && wrlen > 0);
-            assert_eq!(pipe.writes, 2);
+            assert_eq!(pipe.writevs, vec![ vec![ 42, 42 ] ]);
         }
         check_read(&mut client, b"0123456789012345678901234567890123456789");
     }
@@ -1024,7 +1272,6 @@ fn stream_write_reports_underlying_io_error_before_plaintext_processed() {
     assert!(rc.is_err());
     let err = rc.err().unwrap();
     assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-    assert_eq!(err.description(), "oops");
 }
 
 #[test]
@@ -1408,15 +1655,21 @@ struct KeyLogItem {
     secret: Vec<u8>,
 }
 
-struct KeyLogToVec(Mutex<Vec<KeyLogItem>>);
+struct KeyLogToVec {
+    label: &'static str,
+    items: Mutex<Vec<KeyLogItem>>,
+}
 
 impl KeyLogToVec {
-    fn new() -> Self {
-        KeyLogToVec(Mutex::new(vec![]))
+    fn new(who: &'static str) -> Self {
+        KeyLogToVec {
+            label: who,
+            items: Mutex::new(vec![]),
+        }
     }
 
     fn take(&self) -> Vec<KeyLogItem> {
-        mem::replace(&mut self.0.lock()
+        mem::replace(&mut self.items.lock()
                          .unwrap(),
                      vec![])
     }
@@ -1430,7 +1683,9 @@ impl KeyLog for KeyLogToVec {
             secret: secret.into()
         };
 
-        self.0.lock()
+        println!("key log {:?}: {:?}", self.label, value);
+
+        self.items.lock()
             .unwrap()
             .push(value);
     }
@@ -1438,8 +1693,8 @@ impl KeyLog for KeyLogToVec {
 
 #[test]
 fn key_log_for_tls12() {
-    let client_key_log = Arc::new(KeyLogToVec::new());
-    let server_key_log = Arc::new(KeyLogToVec::new());
+    let client_key_log = Arc::new(KeyLogToVec::new("client"));
+    let server_key_log = Arc::new(KeyLogToVec::new("server"));
 
     let kt = KeyType::RSA;
     let mut client_config = make_client_config(kt);
@@ -1475,8 +1730,8 @@ fn key_log_for_tls12() {
 
 #[test]
 fn key_log_for_tls13() {
-    let client_key_log = Arc::new(KeyLogToVec::new());
-    let server_key_log = Arc::new(KeyLogToVec::new());
+    let client_key_log = Arc::new(KeyLogToVec::new("client"));
+    let server_key_log = Arc::new(KeyLogToVec::new("server"));
 
     let kt = KeyType::RSA;
     let mut client_config = make_client_config(kt);
@@ -1538,7 +1793,7 @@ fn vectored_write_for_server_appdata() {
     server.write(b"01234567890123456789").unwrap();
     {
         let mut pipe = OtherSession::new(&mut client);
-        let wrlen = server.writev_tls(&mut pipe).unwrap();
+        let wrlen = server.write_tls(&mut pipe).unwrap();
         assert_eq!(84, wrlen);
         assert_eq!(pipe.writevs, vec![vec![42, 42]]);
     }
@@ -1554,7 +1809,7 @@ fn vectored_write_for_client_appdata() {
     client.write(b"01234567890123456789").unwrap();
     {
         let mut pipe = OtherSession::new(&mut server);
-        let wrlen = client.writev_tls(&mut pipe).unwrap();
+        let wrlen = client.write_tls(&mut pipe).unwrap();
         assert_eq!(84, wrlen);
         assert_eq!(pipe.writevs, vec![vec![42, 42]]);
     }
@@ -1572,7 +1827,7 @@ fn vectored_write_for_server_handshake() {
     server.process_new_packets().unwrap();
     {
         let mut pipe = OtherSession::new(&mut client);
-        let wrlen = server.writev_tls(&mut pipe).unwrap();
+        let wrlen = server.write_tls(&mut pipe).unwrap();
         // don't assert exact sizes here, to avoid a brittle test
         assert!(wrlen > 4000); // its pretty big (contains cert chain)
         assert_eq!(pipe.writevs.len(), 1); // only one writev
@@ -1584,7 +1839,7 @@ fn vectored_write_for_server_handshake() {
     server.process_new_packets().unwrap();
     {
         let mut pipe = OtherSession::new(&mut client);
-        let wrlen = server.writev_tls(&mut pipe).unwrap();
+        let wrlen = server.write_tls(&mut pipe).unwrap();
         assert_eq!(wrlen, 177);
         assert_eq!(pipe.writevs, vec![vec![103, 42, 32]]);
     }
@@ -1602,7 +1857,7 @@ fn vectored_write_for_client_handshake() {
     client.write(b"0123456789").unwrap();
     {
         let mut pipe = OtherSession::new(&mut server);
-        let wrlen = client.writev_tls(&mut pipe).unwrap();
+        let wrlen = client.write_tls(&mut pipe).unwrap();
         // don't assert exact sizes here, to avoid a brittle test
         assert!(wrlen > 200); // just the client hello
         assert_eq!(pipe.writevs.len(), 1); // only one writev
@@ -1614,7 +1869,7 @@ fn vectored_write_for_client_handshake() {
 
     {
         let mut pipe = OtherSession::new(&mut server);
-        let wrlen = client.writev_tls(&mut pipe).unwrap();
+        let wrlen = client.write_tls(&mut pipe).unwrap();
         assert_eq!(wrlen, 138);
         // CCS, finished, then two application datas
         assert_eq!(pipe.writevs, vec![vec![6, 58, 42, 32]]);
@@ -1637,12 +1892,12 @@ fn vectored_write_with_slow_client() {
     {
         let mut pipe = OtherSession::new(&mut client);
         pipe.short_writes = true;
-        let wrlen = server.writev_tls(&mut pipe).unwrap() +
-            server.writev_tls(&mut pipe).unwrap() +
-            server.writev_tls(&mut pipe).unwrap() +
-            server.writev_tls(&mut pipe).unwrap() +
-            server.writev_tls(&mut pipe).unwrap() +
-            server.writev_tls(&mut pipe).unwrap();
+        let wrlen = server.write_tls(&mut pipe).unwrap() +
+            server.write_tls(&mut pipe).unwrap() +
+            server.write_tls(&mut pipe).unwrap() +
+            server.write_tls(&mut pipe).unwrap() +
+            server.write_tls(&mut pipe).unwrap() +
+            server.write_tls(&mut pipe).unwrap();
         assert_eq!(42, wrlen);
         assert_eq!(pipe.writevs, vec![vec![21], vec![10], vec![5], vec![3], vec![3]]);
     }
@@ -1777,7 +2032,7 @@ mod test_quic {
     use super::*;
 
     // Returns the sender's next secrets to use, or the receiver's error.
-    fn step(send: &mut dyn Session, recv: &mut dyn Session) -> Result<Option<quic::Secrets>, TLSError> {
+    fn step(send: &mut dyn Session, recv: &mut dyn Session) -> Result<Option<quic::Keys>, TLSError> {
         let mut buf = Vec::new();
         let secrets = loop {
             let prev = buf.len();
@@ -1798,18 +2053,13 @@ mod test_quic {
 
 #[test]
     fn test_quic_handshake() {
-        fn equal_prk(x: &ring::hkdf::Prk, y: &ring::hkdf::Prk) -> bool {
-            let mut x_data = [0; 16];
-            let mut y_data = [0; 16];
-            let x_okm = x.expand(&[b"info"], &ring::aead::quic::AES_128).unwrap();
-            x_okm.fill(&mut x_data[..]).unwrap();
-            let y_okm = y.expand(&[b"info"], &ring::aead::quic::AES_128).unwrap();
-            y_okm.fill(&mut y_data[..]).unwrap();
-            x_data == y_data
+        fn equal_dir_keys(x: &quic::DirectionalKeys, y: &quic::DirectionalKeys) -> bool {
+            // Check that these two sets of keys are equal. The quic module's unit tests validate
+            // that the IV and the keys are consistent, so we can just check the IV here.
+            x.packet.iv.nonce_for(42).as_ref() == y.packet.iv.nonce_for(42).as_ref()
         }
-
-        fn equal_secrets(x: &quic::Secrets, y: &quic::Secrets) -> bool {
-            equal_prk(&x.client, &y.client) && equal_prk(&x.server, &y.server)
+        fn compatible_keys(x: &quic::Keys, y: &quic::Keys) -> bool {
+            equal_dir_keys(&x.local, &y.remote) && equal_dir_keys(&x.remote, &y.local)
         }
 
         let kt = KeyType::RSA;
@@ -1831,12 +2081,12 @@ mod test_quic {
         let mut server = ServerSession::new_quic(&server_config, server_params.into());
         let client_initial = step(&mut client, &mut server).unwrap();
         assert!(client_initial.is_none());
-        assert!(client.get_early_secret().is_none());
+        assert!(client.get_0rtt_keys().is_none());
         assert_eq!(server.get_quic_transport_parameters(), Some(client_params));
         let server_hs = step(&mut server, &mut client).unwrap().unwrap();
-        assert!(server.get_early_secret().is_none());
+        assert!(server.get_0rtt_keys().is_none());
         let client_hs = step(&mut client, &mut server).unwrap().unwrap();
-        assert!(equal_secrets(&server_hs, &client_hs));
+        assert!(compatible_keys(&server_hs, &client_hs));
         assert!(client.is_handshaking());
         let server_1rtt = step(&mut server, &mut client).unwrap().unwrap();
         assert!(!client.is_handshaking());
@@ -1844,44 +2094,10 @@ mod test_quic {
         assert!(server.is_handshaking());
         let client_1rtt = step(&mut client, &mut server).unwrap().unwrap();
         assert!(!server.is_handshaking());
-        assert!(equal_secrets(&server_1rtt, &client_1rtt));
-        assert!(!equal_secrets(&server_hs, &server_1rtt));
+        assert!(compatible_keys(&server_1rtt, &client_1rtt));
+        assert!(!compatible_keys(&server_hs, &server_1rtt));
         assert!(step(&mut client, &mut server).unwrap().is_none());
         assert!(step(&mut server, &mut client).unwrap().is_none());
-
-        // key update
-        let initial = quic::Secrets {
-            // Constant dummy values for reproducibility
-            client: hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, &[
-                0xb8, 0x76, 0x77, 0x08, 0xf8, 0x77, 0x23, 0x58, 0xa6, 0xea, 0x9f, 0xc4, 0x3e, 0x4a,
-                0xdd, 0x2c, 0x96, 0x1b, 0x3f, 0x52, 0x87, 0xa6, 0xd1, 0x46, 0x7e, 0xe0, 0xae, 0xab,
-                0x33, 0x72, 0x4d, 0xbf,
-            ]),
-            server: hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, &[
-                0x42, 0xdc, 0x97, 0x21, 0x40, 0xe0, 0xf2, 0xe3, 0x98, 0x45, 0xb7, 0x67, 0x61, 0x34,
-                0x39, 0xdc, 0x67, 0x58, 0xca, 0x43, 0x25, 0x9b, 0x87, 0x85, 0x06, 0x82, 0x4e, 0xb1,
-                0xe4, 0x38, 0xd8, 0x55,
-            ]),
-        };
-        let updated = client.update_secrets(&initial.client, &initial.server);
-        // The expected values will need to be updated if the negotiated hash function changes. Pull the
-        // values from ring's `hmac::Key::construct` with a debugger.
-        assert!(equal_prk(
-            &updated.client,
-            &hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, &[
-                0x42, 0xca, 0xc8, 0xc9, 0x1c, 0xd5, 0xeb, 0x40, 0x68, 0x2e, 0x43, 
-                0x2e, 0xdf, 0x2d, 0x2b, 0xe9, 0xf4, 0x1a, 0x52, 0xca, 0x6b, 0x22, 0xd8, 0xe6, 0xcd, 0xb1, 
-                0xe8, 0xac, 0xa9, 0x6, 0x1f, 0xce
-            ]))
-        );
-        assert!(equal_prk(
-            &updated.server,
-            &hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, &[
-                0xeb, 0x7f, 0x5e, 0x2a, 0x12, 0x3f, 0x40, 0x7d, 0xb4, 0x99, 0xe3, 
-                0x61, 0xca, 0xe5, 0x90, 0xd4, 0xd9, 0x92, 0xe1, 0x4b, 0x7a, 0xce, 0x3, 0xc2, 0x44, 0xe0, 
-                0x42, 0x21, 0x15, 0xb6, 0xd3, 0x8a
-            ]))
-        );
 
         // 0-RTT handshake
         let mut client =
@@ -1891,9 +2107,9 @@ mod test_quic {
         step(&mut client, &mut server).unwrap();
         assert_eq!(client.get_quic_transport_parameters(), Some(server_params));
         {
-            let client_early = client.get_early_secret().unwrap();
-            let server_early = server.get_early_secret().unwrap();
-            assert!(equal_prk(client_early, server_early));
+            let client_early = client.get_0rtt_keys().unwrap();
+            let server_early = server.get_0rtt_keys().unwrap();
+            assert!(equal_dir_keys(&client_early, &server_early));
         }
         step(&mut server, &mut client).unwrap().unwrap();
         step(&mut client, &mut server).unwrap().unwrap();
@@ -1904,13 +2120,16 @@ mod test_quic {
         {
             let mut client_config = (*client_config).clone();
             client_config.alpn_protocols = vec!["foo".into()];
-            let mut client =
-                ClientSession::new_quic(&Arc::new(client_config), dns_name("localhost"), client_params.into());
+            let mut client = ClientSession::new_quic(
+                &Arc::new(client_config),
+                dns_name("localhost"),
+                client_params.into(),
+            );
             let mut server = ServerSession::new_quic(&server_config, server_params.into());
             step(&mut client, &mut server).unwrap();
             assert_eq!(client.get_quic_transport_parameters(), Some(server_params));
-            assert!(client.get_early_secret().is_some());
-            assert!(server.get_early_secret().is_none());
+            assert!(client.get_0rtt_keys().is_some());
+            assert!(server.get_0rtt_keys().is_none());
             step(&mut server, &mut client).unwrap().unwrap();
             step(&mut client, &mut server).unwrap().unwrap();
             step(&mut server, &mut client).unwrap().unwrap();
@@ -1926,7 +2145,7 @@ mod test_quic {
         let mut server = ServerSession::new_quic(&server_config, server_params.into());
         step(&mut client, &mut server).unwrap();
         step(&mut server, &mut client).unwrap().unwrap();
-        step(&mut server, &mut client).unwrap_err();
+        assert!(step(&mut server, &mut client).is_err());
         assert_eq!(
             client.get_alert(),
             Some(rustls::internal::msgs::enums::AlertDescription::BadCertificate)
@@ -1955,7 +2174,7 @@ mod test_quic {
             let mut server = ServerSession::new_quic(&server_config,
                                                      server_params.into());
 
-            assert_eq!(step(&mut client, &mut server).unwrap_err(),
+            assert_eq!(step(&mut client, &mut server).err().unwrap(),
                        TLSError::NoApplicationProtocol);
 
             assert_eq!(server.get_alert(),
@@ -2001,21 +2220,30 @@ fn test_client_does_not_offer_sha1() {
 
 #[test]
 fn test_client_mtu_reduction() {
-    fn collect_write_lengths(client: &mut ClientSession) -> Vec<usize> {
-        let mut r = Vec::new();
-        let mut buf = [0u8; 128];
+    struct CollectWrites {
+        writevs: Vec<Vec<usize>>,
+    }
 
-        loop {
-            let sz = client.write_tls(&mut buf.as_mut())
-                .unwrap();
-            r.push(sz);
-            assert!(sz <= 64);
-            if sz < 64 {
-                break;
-            }
+    impl io::Write for CollectWrites {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!() }
+        fn flush(&mut self) -> io::Result<()> { panic!() }
+        fn write_vectored<'b>(&mut self, b: &[io::IoSlice<'b>]) -> io::Result<usize> {
+            let writes = b.iter()
+                .map(|slice| slice.len())
+                .collect::<Vec<usize>>();
+            let len = writes.iter().sum();
+            self.writevs.push(writes);
+            Ok(len)
         }
+    }
 
-        r
+    fn collect_write_lengths(client: &mut ClientSession) -> Vec<usize> {
+        let mut collector = CollectWrites { writevs: vec![] };
+
+        client.write_tls(&mut collector)
+            .unwrap();
+        assert_eq!(collector.writevs.len(), 1);
+        collector.writevs[0].clone()
     }
 
     for kt in ALL_KEY_TYPES.iter() {
@@ -2024,6 +2252,7 @@ fn test_client_mtu_reduction() {
 
         let mut client = ClientSession::new(&Arc::new(client_config), dns_name("localhost"));
         let writes = collect_write_lengths(&mut client);
+        println!("writes at mtu=64: {:?}", writes);
         assert!(writes.iter().all(|x| *x <= 64));
         assert!(writes.len() > 1);
     }
@@ -2080,4 +2309,76 @@ fn session_types_are_not_huge() {
     // Arbitrary sizes
     assert_lt(mem::size_of::<ServerSession>(), 1600);
     assert_lt(mem::size_of::<ClientSession>(), 1600);
+}
+
+use rustls::internal::msgs::{message::Message, message::MessagePayload,
+    handshake::HandshakePayload, handshake::ClientExtension};
+
+#[test]
+fn test_server_rejects_duplicate_sni_names() {
+    fn duplicate_sni_payload(msg: &mut Message) {
+        if let MessagePayload::Handshake(hs) = &mut msg.payload {
+            if let HandshakePayload::ClientHello(ch) = &mut hs.payload {
+                for mut ext in ch.extensions.iter_mut() {
+                    if let ClientExtension::ServerName(snr) = &mut ext {
+                        snr.push(snr[0].clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let (mut client, mut server) = make_pair(KeyType::RSA);
+    transfer_altered(&mut client, duplicate_sni_payload, &mut server);
+    assert_eq!(server.process_new_packets(),
+               Err(TLSError::PeerMisbehavedError("ClientHello SNI contains duplicate name types".into())));
+}
+
+#[test]
+fn test_server_rejects_empty_sni_extension() {
+    fn empty_sni_payload(msg: &mut Message) {
+        if let MessagePayload::Handshake(hs) = &mut msg.payload {
+            if let HandshakePayload::ClientHello(ch) = &mut hs.payload {
+                for mut ext in ch.extensions.iter_mut() {
+                    if let ClientExtension::ServerName(snr) = &mut ext {
+                        snr.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    let (mut client, mut server) = make_pair(KeyType::RSA);
+    transfer_altered(&mut client, empty_sni_payload, &mut server);
+    assert_eq!(server.process_new_packets(),
+               Err(TLSError::PeerMisbehavedError("ClientHello SNI did not contain a hostname".into())));
+}
+
+#[test]
+fn test_server_rejects_clients_without_any_kx_group_overlap() {
+    fn different_kx_group(msg: &mut Message) {
+        if let MessagePayload::Handshake(hs) = &mut msg.payload {
+            if let HandshakePayload::ClientHello(ch) = &mut hs.payload {
+                for mut ext in ch.extensions.iter_mut() {
+                    if let ClientExtension::NamedGroups(ngs) = &mut ext {
+                        ngs.clear();
+                    }
+                    if let ClientExtension::KeyShare(ks) = &mut ext {
+                        ks.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    let (mut client, mut server) = make_pair(KeyType::RSA);
+    transfer_altered(&mut client, different_kx_group, &mut server);
+    assert_eq!(server.process_new_packets(),
+               Err(TLSError::PeerIncompatibleError("no kx group overlap with client".into())));
+}
+
+#[test]
+fn test_ownedtrustanchor_to_trust_anchor_is_public() {
+    let client_config = make_client_config(KeyType::RSA);
+    let _anchor: webpki::TrustAnchor = client_config.root_store.roots[0].to_trust_anchor();
 }

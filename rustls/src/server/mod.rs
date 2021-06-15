@@ -10,14 +10,13 @@ use crate::error::TLSError;
 use crate::sign;
 use crate::verify;
 use crate::key;
-use crate::vecbuf::WriteV;
 #[cfg(feature = "logging")]
 use crate::log::trace;
 
 use webpki;
 
 use std::sync::Arc;
-use std::io;
+use std::io::{self, IoSlice};
 use std::fmt;
 
 #[macro_use]
@@ -112,8 +111,9 @@ pub struct ClientHello<'a> {
 
 impl<'a> ClientHello<'a> {
     /// Creates a new ClientHello
-    fn new(server_name: Option<webpki::DNSNameRef<'a>>, sigschemes:  &'a [SignatureScheme],
-    alpn: Option<&'a[&'a[u8]]>)->Self {
+    fn new(server_name: Option<webpki::DNSNameRef<'a>>,
+           sigschemes:  &'a [SignatureScheme],
+           alpn: Option<&'a[&'a[u8]]>) -> Self {
         ClientHello {server_name, sigschemes, alpn}
     }
 
@@ -405,6 +405,17 @@ impl ServerSessionImpl {
         self.common.send_fatal_alert(AlertDescription::UnexpectedMessage);
     }
 
+    fn maybe_send_unexpected_alert(&mut self, rc: hs::NextStateOrError) -> hs::NextStateOrError {
+        match rc {
+            Err(TLSError::InappropriateMessage { .. }) |
+            Err(TLSError::InappropriateHandshakeMessage { .. }) => {
+                self.queue_unexpected_alert();
+            }
+            _ => {}
+        };
+        rc
+    }
+
     pub fn process_main_protocol(&mut self, msg: Message) -> Result<(), TLSError> {
         if self.common.traffic && !self.common.is_tls13() &&
            msg.is_handshake_type(HandshakeType::ClientHello) {
@@ -412,11 +423,10 @@ impl ServerSessionImpl {
             return Ok(());
         }
 
-        let st = self.state.take().unwrap();
-        st.check_message(&msg)
-            .map_err(|err| { self.queue_unexpected_alert(); err })?;
-
-        self.state = Some(st.handle(self, msg)?);
+        let state = self.state.take().unwrap();
+        let maybe_next_state = state.handle(self, msg);
+        let next_state = self.maybe_send_unexpected_alert(maybe_next_state)?;
+        self.state = Some(next_state);
 
         Ok(())
     }
@@ -576,10 +586,6 @@ impl Session for ServerSession {
         self.imp.common.write_tls(wr)
     }
 
-    fn writev_tls(&mut self, wr: &mut dyn WriteV) -> io::Result<usize> {
-        self.imp.common.writev_tls(wr)
-    }
-
     fn process_new_packets(&mut self) -> Result<(), TLSError> {
         self.imp.process_new_packets()
     }
@@ -649,6 +655,14 @@ impl io::Write for ServerSession {
     /// cause excess memory usage.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.imp.send_some_plaintext(buf)
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        let mut sz = 0;
+        for buf in bufs {
+            sz += self.imp.send_some_plaintext(buf)?;
+        }
+        Ok(sz)
     }
 
     fn flush(&mut self) -> io::Result<()> {

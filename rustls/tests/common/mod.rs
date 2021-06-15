@@ -1,9 +1,5 @@
-use std::fs::{self, File};
-use std::str;
-use tempfile;
-
 use std::sync::Arc;
-use std::io::{self, Write};
+use std::io;
 
 use rustls;
 
@@ -15,6 +11,16 @@ use rustls::TLSError;
 use rustls::{Certificate, PrivateKey};
 use rustls::internal::pemfile;
 use rustls::{RootCertStore, NoClientAuth, AllowAnyAuthenticatedClient};
+use rustls::internal::msgs::{codec::Codec, codec::Reader, message::Message};
+
+#[cfg(feature = "dangerous_configuration")]
+use rustls::{
+    ClientCertVerified,
+    ClientCertVerifier,
+    DistinguishedNames,
+    SignatureScheme,
+    WebPKIVerifier
+};
 
 use webpki;
 
@@ -36,20 +42,6 @@ macro_rules! embed_files {
                 )+
                 _ => panic!("unknown keytype {} with path {}", keytype, path),
             }
-        }
-
-        pub fn new_test_ca() -> tempfile::TempDir {
-            let dir = tempfile::TempDir::new().unwrap();
-
-            fs::create_dir(dir.path().join("ecdsa")).unwrap();
-            fs::create_dir(dir.path().join("rsa")).unwrap();
-
-            $(
-                let mut f = File::create(dir.path().join($keytype).join($path)).unwrap();
-                f.write($name).unwrap();
-            )+
-
-            dir
         }
     }
 }
@@ -121,6 +113,37 @@ pub fn transfer(left: &mut dyn Session, right: &mut dyn Session) -> usize {
     total
 }
 
+pub fn transfer_altered<F>(left: &mut dyn Session, filter: F, right: &mut dyn Session) -> usize
+    where F: Fn(&mut Message) {
+    let mut buf = [0u8; 262144];
+    let mut total = 0;
+
+    while left.wants_write() {
+        let sz = {
+            let into_buf: &mut dyn io::Write = &mut &mut buf[..];
+            left.write_tls(into_buf).unwrap()
+        };
+        total += sz;
+        if sz == 0 {
+            return total;
+        }
+
+        let mut reader = Reader::init(&buf[..sz]);
+        while reader.any_left() {
+            let mut message = Message::read(&mut reader)
+                .unwrap();
+            message.decode_payload();
+            filter(&mut message);
+            let message_enc = message.get_encoding();
+            let message_enc_reader: &mut dyn io::Read = &mut &message_enc[..];
+            let len = right.read_tls(message_enc_reader).unwrap();
+            assert_eq!(len, message_enc.len());
+        }
+    }
+
+    total
+}
+
 #[derive(Clone, Copy)]
 pub enum KeyType {
     RSA,
@@ -167,12 +190,17 @@ pub fn make_server_config(kt: KeyType) -> ServerConfig {
     cfg
 }
 
-pub fn make_server_config_with_mandatory_client_auth(kt: KeyType) -> ServerConfig {
+pub fn get_client_root_store(kt: KeyType) -> RootCertStore {
     let roots = kt.get_chain();
     let mut client_auth_roots = RootCertStore::empty();
     for root in roots {
         client_auth_roots.add(&root).unwrap();
     }
+    client_auth_roots
+}
+
+pub fn make_server_config_with_mandatory_client_auth(kt: KeyType) -> ServerConfig {
+    let client_auth_roots = get_client_root_store(kt);
 
     let client_auth = AllowAnyAuthenticatedClient::new(client_auth_roots);
     let mut cfg = ServerConfig::new(NoClientAuth::new());
@@ -192,7 +220,8 @@ pub fn make_client_config(kt: KeyType) -> ClientConfig {
 
 pub fn make_client_config_with_auth(kt: KeyType) -> ClientConfig {
     let mut cfg = make_client_config(kt);
-    cfg.set_single_client_cert(kt.get_client_chain(), kt.get_client_key());
+    cfg.set_single_client_cert(kt.get_client_chain(), kt.get_client_key())
+        .unwrap();
     cfg
 }
 
@@ -258,6 +287,42 @@ impl Iterator for AllClientVersions {
     }
 }
 
+#[cfg(feature = "dangerous_configuration")]
+pub struct MockClientVerifier {
+    pub verified: fn() -> Result<ClientCertVerified, TLSError>,
+    pub subjects: Option<DistinguishedNames>,
+    pub mandatory: Option<bool>,
+    pub offered_schemes: Option<Vec<SignatureScheme>>,
+}
+
+#[cfg(feature = "dangerous_configuration")]
+impl ClientCertVerifier for MockClientVerifier {
+    fn client_auth_mandatory(&self, sni: Option<&webpki::DNSName>) -> Option<bool> {
+        // This is just an added 'test' to make sure we plumb through the SNI,
+        // although its valid for it to be None, its just our tests should (as of now) always provide it
+        assert!(sni.is_some());
+        self.mandatory
+    }
+
+    fn client_auth_root_subjects(&self, sni: Option<&webpki::DNSName>) -> Option<DistinguishedNames> {
+        assert!(sni.is_some());
+        self.subjects.as_ref().cloned()
+    }
+
+    fn verify_client_cert(&self, _presented_certs: &[Certificate], sni: Option<&webpki::DNSName>) -> Result<ClientCertVerified, TLSError> {
+        assert!(sni.is_some());
+        (self.verified)()
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        if let Some(schemes) = &self.offered_schemes {
+            schemes.clone()
+        } else {
+            WebPKIVerifier::verification_schemes()
+        }
+    }
+}
+
 #[derive(PartialEq, Debug)]
 pub enum TLSErrorFromPeer { Client(TLSError), Server(TLSError) }
 
@@ -274,6 +339,33 @@ pub fn do_handshake_until_error(client: &mut ClientSession,
     }
 
     Ok(())
+}
+
+pub fn do_handshake_until_both_error(client: &mut ClientSession,
+                                     server: &mut ServerSession) -> Result<(), Vec<TLSErrorFromPeer>> {
+    match do_handshake_until_error(client, server) {
+        Err(server_err @ TLSErrorFromPeer::Server(_)) => {
+            let mut errors = vec![ server_err ];
+            transfer(server, client);
+            let client_err = client.process_new_packets()
+                .map_err(|err| TLSErrorFromPeer::Client(err))
+                .expect_err("client didn't produce error after server error");
+            errors.push(client_err);
+            Err(errors)
+        }
+
+        Err(client_err @ TLSErrorFromPeer::Client(_)) => {
+            let mut errors = vec![ client_err ];
+            transfer(client, server);
+            let server_err = server.process_new_packets()
+                .map_err(|err| TLSErrorFromPeer::Server(err))
+                .expect_err("server didn't produce error after client error");
+            errors.push(server_err);
+            Err(errors)
+        }
+
+        Ok(()) => Ok(())
+    }
 }
 
 pub fn dns_name(name: &'static str) -> webpki::DNSNameRef<'_> {

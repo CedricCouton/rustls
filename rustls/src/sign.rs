@@ -12,7 +12,7 @@ use std::mem;
 pub trait SigningKey : Send + Sync {
     /// Choose a `SignatureScheme` from those offered.
     ///
-    /// Expresses the choice something that implements `Signer`,
+    /// Expresses the choice by returning something that implements `Signer`,
     /// using the chosen scheme.
     fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>>;
 
@@ -161,7 +161,7 @@ pub struct RSASigningKey {
     key: Arc<RsaKeyPair>,
 }
 
-static ALL_RSA_SCHEMES: &'static [SignatureScheme] = &[
+static ALL_RSA_SCHEMES: &[SignatureScheme] = &[
      SignatureScheme::RSA_PSS_SHA512,
      SignatureScheme::RSA_PSS_SHA384,
      SignatureScheme::RSA_PSS_SHA256,

@@ -1,10 +1,10 @@
 [package]
 name = "rustls"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2018"
 authors = ["Joseph Birr-Pixton <jpixton@gmail.com>"]
 license = "Apache-2.0/ISC/MIT"
-readme = "README.md"
+readme = "../README.md"
 description = "Rustls is a modern TLS library written in Rust."
 homepage = "https://github.com/ctz/rustls"
 repository = "https://github.com/ctz/rustls"
@@ -12,9 +12,9 @@ categories = ["network-programming", "cryptography"]
 autobenches = false
 
 [dependencies]
-base64 = "0.11"
+base64 = "=0.12.1"
 log = { version = "0.4.4", optional = true }
-ring = "0.16.5"
+ring = "0.16.11"
 sct = "0.6.0"
 webpki = { git = "https://github.com/CedricCouton/webpki" }
 
@@ -27,8 +27,7 @@ quic = []
 [dev-dependencies]
 env_logger = "0.7.1"
 log = "0.4.4"
-tempfile = "3.0"
-webpki-roots = "0.18.0"
+webpki-roots = "0.19.0"
 criterion = "0.3.0"
 
 [[example]]
@@ -48,3 +47,7 @@ path = "examples/internal/bench.rs"
 name = "benchmarks"
 path = "tests/benchmarks.rs"
 harness = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
