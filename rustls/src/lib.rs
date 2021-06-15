@@ -275,8 +275,10 @@ mod x509;
 mod check;
 mod bs_debug;
 mod builder;
-mod client;
-mod key;
+#[allow(missing_docs)]
+pub mod client;
+#[allow(missing_docs)]
+pub mod key;
 mod keylog;
 mod kx;
 mod server;
