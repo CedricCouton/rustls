@@ -421,7 +421,6 @@ static ECDSA_SHA384: SignatureAlgorithms = &[
     &webpki::ECDSA_P384_SHA384
 ];
 
-static RSA_SHA1: SignatureAlgorithms = &[&webpki::RSA_PKCS1_2048_8192_SHA1];
 static RSA_SHA256: SignatureAlgorithms = &[&webpki::RSA_PKCS1_2048_8192_SHA256];
 static RSA_SHA384: SignatureAlgorithms = &[&webpki::RSA_PKCS1_2048_8192_SHA384];
 static RSA_SHA512: SignatureAlgorithms = &[&webpki::RSA_PKCS1_2048_8192_SHA512];
@@ -436,7 +435,6 @@ fn convert_scheme(scheme: SignatureScheme) -> Result<SignatureAlgorithms, TLSErr
         SignatureScheme::ECDSA_NISTP384_SHA384 => Ok(ECDSA_SHA384),
 
         SignatureScheme::RSA_PKCS1_SHA256 => Ok(RSA_SHA256),
-        SignatureScheme::RSA_PKCS1_SHA1 => Ok(RSA_SHA1),
         SignatureScheme::RSA_PKCS1_SHA384 => Ok(RSA_SHA384),
         SignatureScheme::RSA_PKCS1_SHA512 => Ok(RSA_SHA512),
 
